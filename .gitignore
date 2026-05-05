@@ -1,0 +1,45 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyd
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+*.egg
+
+# Virtual environments
+venv/
+env/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Log files
+*.log
+*.txt
+!requirements.txt
+
+# Temporary / debug files
+*.tmp
+*.bak
+*.cache
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Model downloads (large, downloaded at runtime)
+~/.cache/
+.huggingface/
+
+# Index data (user-specific, generated locally)
+# Uncomment below to exclude vector index from repo
+# vectors.faiss
+# metadata.json

@@ -1,0 +1,38 @@
+# MediaSearch - 本地图片/视频/文档语义检索系统 依赖清单
+# 环境：conda aimodel (Python 3.11.4)
+# torch 版本锁定：2.0.1+cu117（GTX 1080 Ti / CUDA 11.7）
+#
+# 安装顺序（非常重要）：
+#
+# 第1步：先锁定 torch（防止被其他包升级破坏 CUDA）
+#   pip install torch==2.0.1+cu117 torchvision==0.15.2+cu117 torchaudio==2.0.2+cu117 --index-url https://download.pytorch.org/whl/cu117
+#
+# 第2步：再安装其余依赖
+#   pip install -r requirements.txt --no-deps
+#
+# 说明：--no-deps 防止依赖解析器自动升级 torch
+
+# CLIP（Chinese-CLIP）
+cn-clip
+
+# 向量检索
+faiss-cpu>=1.7.4
+
+# Web UI（必须 4.x+ 才能与新版 FastAPI 兼容）
+gradio>=4.44.1
+
+# 图像处理
+Pillow>=9.0
+opencv-python>=4.8
+
+# 文档处理
+pdfplumber>=0.10.0
+python-docx>=1.0.0
+openpyxl>=3.1.0
+pdf2image>=1.17.0
+
+# 工具
+tqdm
+numpy<2.0
+ftfy>=6.0
+regex
