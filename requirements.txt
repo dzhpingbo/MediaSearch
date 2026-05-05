@@ -1,4 +1,4 @@
-# MediaSearch - 本地图片/视频/文档语义检索系统 依赖清单
+# MediaSearch - 依赖清单
 # 环境：conda aimodel (Python 3.11.4)
 # torch 版本锁定：2.0.1+cu117（GTX 1080 Ti / CUDA 11.7）
 #
@@ -30,6 +30,14 @@ pdfplumber>=0.10.0
 python-docx>=1.0.0
 openpyxl>=3.1.0
 pdf2image>=1.17.0
+
+# OCR（PaddleOCR - 用于扫描型 PDF）
+paddlepaddle-gpu>=2.6.0
+# paddleocr 依赖较多，建议单独安装：
+# pip install paddleocr --no-deps
+
+# 自动增量更新（watchdog）
+watchdog>=3.0.0
 
 # 工具
 tqdm

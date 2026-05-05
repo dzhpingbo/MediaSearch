@@ -252,11 +252,156 @@ def encode_images_batch(image_paths: list, batch_size: int = 16) -> list:
     return results
 
 
-# ── 文档文本提取 ─────────────────────────────────────────────
-import io
+# ══════════════════════════════════════════════════════════════════
+#  功能1: EasyOCR - 扫描型 PDF / 图片文字识别
+#  （PaddleOCR 依赖过于复杂，EasyOCR 更稳定，支持中文+GPU）
+# ══════════════════════════════════════════════════════════════════
+_EASY_OCR_ENGINE = None
 
-def extract_pdf_text(file_path: str, max_pages: int = 20) -> str:
-    """提取 PDF 文本内容（支持文本型 PDF）"""
+def get_easy_ocr():
+    """懒加载 EasyOCR（首次使用时初始化，GPU 加速）"""
+    global _EASY_OCR_ENGINE
+    if _EASY_OCR_ENGINE is None:
+        try:
+            import easyocr
+            print("[Encoder] 初始化 EasyOCR（中文+英文，GPU 加速）...")
+            _EASY_OCR_ENGINE = easyocr.Reader(
+                ['ch_sim', 'en'],      # 简体中文 + 英文
+                gpu=True,              # GPU 加速（GTX 1080 Ti）
+                model_storage_directory=os.path.expanduser("~/.cache/easyocr"),
+                download_enabled=True,
+            )
+            print("[Encoder] EasyOCR 初始化完成")
+        except Exception as e:
+            print(f"[Encoder] EasyOCR 初始化失败: {e}")
+            _EASY_OCR_ENGINE = None
+    return _EASY_OCR_ENGINE
+
+def ocr_image(image_path: str) -> str:
+    """用 EasyOCR 识别图片中的文字"""
+    try:
+        engine = get_easy_ocr()
+        if engine is None:
+            return ""
+        result = engine.readtext(image_path)
+        if not result:
+            return ""
+        lines = []
+        for detection in result:
+            if len(detection) >= 2:
+                text = detection[1].strip()
+                if text:
+                    lines.append(text)
+        return "\n".join(lines)
+    except Exception as e:
+        print(f"[Encoder] OCR 识别失败 {image_path}: {e}")
+        return ""
+
+def ocr_pdf_pages(pdf_path: str, max_pages: int = 20) -> str:
+    """将 PDF 页面转为图片，用 EasyOCR 识别文字（扫描型 PDF）"""
+    try:
+        from pdf2image import convert_from_path
+        engine = get_easy_ocr()
+        if engine is None:
+            return ""
+        images = convert_from_path(pdf_path, dpi=150, first_page=1, last_page=max_pages)
+        all_text = []
+        for i, img in enumerate(images):
+            try:
+                import tempfile, os
+                with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False, dir=os.environ.get("TEMP", ".")) as f:
+                    tmp = f.name
+                img.save(tmp, "JPEG", quality=85)
+                text = ocr_image(tmp)
+                if text:
+                    all_text.append(text)
+                os.unlink(tmp)
+            except Exception as e:
+                print(f"[Encoder] PDF 第{i+1}页 OCR 失败: {e}")
+        return "\n".join(all_text)
+    except Exception as e:
+        print(f"[Encoder] PDF OCR 失败 {pdf_path}: {e}")
+        return ""
+
+
+# ══════════════════════════════════════════════════════════════════
+#  功能2: 文档分块 - 长文档按段落/字符数切分
+# ══════════════════════════════════════════════════════════════════
+def chunk_text(text: str, chunk_size: int = 300, overlap: int = 50) -> list:
+    """
+    将长文本切分为多个块（按段落边界或固定字符数）
+    
+    Args:
+        text: 原始文本
+        chunk_size: 每块最大字符数
+        overlap: 相邻块重叠字符数
+    
+    Returns:
+        文本块列表，每块含文本内容和位置信息
+    """
+    if not text or len(text) <= chunk_size:
+        return [{"text": text.strip(), "start": 0, "chunk_id": 0}]
+    
+    chunks = []
+    # 先按段落分割
+    paragraphs = text.split("\n")
+    current_chunk = ""
+    chunk_id = 0
+    
+    for para in paragraphs:
+        para = para.strip()
+        if not para:
+            continue
+        # 如果单个段落就超长，按句子继续切
+        if len(para) > chunk_size:
+            # 先保存当前累积的块
+            if current_chunk.strip():
+                chunks.append({
+                    "text": current_chunk.strip(),
+                    "start": 0,
+                    "chunk_id": chunk_id
+                })
+                chunk_id += 1
+                current_chunk = ""
+            # 按句子切分超长段落
+            for i in range(0, len(para), chunk_size - overlap):
+                sub = para[i:i + chunk_size]
+                chunks.append({
+                    "text": sub.strip(),
+                    "start": i,
+                    "chunk_id": chunk_id
+                })
+                chunk_id += 1
+        elif len(current_chunk) + len(para) + 1 <= chunk_size:
+            current_chunk += ("\n" if current_chunk else "") + para
+        else:
+            # 当前块已满，保存并开新块
+            if current_chunk.strip():
+                chunks.append({
+                    "text": current_chunk.strip(),
+                    "start": 0,
+                    "chunk_id": chunk_id
+                })
+                chunk_id += 1
+            current_chunk = para
+    
+    # 保存最后一块
+    if current_chunk.strip():
+        chunks.append({
+            "text": current_chunk.strip(),
+            "start": 0,
+            "chunk_id": chunk_id
+        })
+    
+    return chunks if chunks else [{"text": text.strip()[:chunk_size], "start": 0, "chunk_id": 0}]
+
+
+# ══════════════════════════════════════════════════════════════════
+#  文档文本提取（支持扫描型 PDF）
+# ══════════════════════════════════════════════════════════════════
+
+def extract_pdf_text(file_path: str, max_pages: int = 50, use_ocr_fallback: bool = True) -> str:
+    """提取 PDF 文本内容（支持文本型 PDF，文本为空时自动回退到 OCR）"""
     try:
         import pdfplumber
         text_parts = []
@@ -267,9 +412,19 @@ def extract_pdf_text(file_path: str, max_pages: int = 20) -> str:
                 text = page.extract_text()
                 if text:
                     text_parts.append(text)
-        return "\n".join(text_parts).strip()
+        text = "\n".join(text_parts).strip()
+
+        # 功能1: 如果文本为空（扫描型PDF），自动回退到 OCR（EasyOCR）
+        if (not text or len(text) < 50) and use_ocr_fallback:
+            print(f"[Encoder] PDF 文本内容过少，启用 EasyOCR: {file_path}")
+            text = ocr_pdf_pages(file_path, max_pages=max_pages)
+
+        return text
     except Exception as e:
         print(f"[Encoder] PDF文本提取失败 {file_path}: {e}")
+        # 回退到 OCR（EasyOCR）
+        if use_ocr_fallback:
+            return ocr_pdf_pages(file_path, max_pages=max_pages)
         return ""
 
 def extract_pdf_images(file_path: str, max_pages: int = 5) -> list:
@@ -347,14 +502,50 @@ def extract_document_text(file_path: str) -> str:
     else:
         return ""
 
-def encode_document(file_path: str) -> Optional[np.ndarray]:
-    """提取文档文本并用文本编码器编码为向量"""
+def encode_document(file_path: str, chunk_size: int = 300) -> list:
+    """
+    提取文档文本，分块，每块编码为向量（功能2：文档分块索引）
+    
+    Returns:
+        list of dicts: [{"chunk_text": str, "chunk_id": int, "vector": np.ndarray}, ...]
+        如果文本太短无法分块，返回空列表
+    """
     try:
         text = extract_document_text(file_path)
-        if not text or len(text) < 10:  # 文本太短，跳过
+        if not text or len(text) < 10:
+            return []
+        
+        # 功能2: 按段落/字符数分块
+        chunks = chunk_text(text, chunk_size=chunk_size)
+        
+        results = []
+        for chunk in chunks:
+            chunk_text_str = chunk["text"]
+            if len(chunk_text_str) < 5:  # 跳过太短的块
+                continue
+            # 用 Chinese-CLIP 文本编码器编码（前512字符）
+            vec = encode_text(chunk_text_str[:512])
+            results.append({
+                "chunk_text": chunk_text_str,
+                "chunk_id": chunk["chunk_id"],
+                "vector": vec,
+            })
+        return results
+    except Exception as e:
+        print(f"[Encoder] 文档编码失败 {file_path}: {e}")
+        return []
+
+
+def encode_document_single(file_path: str) -> Optional[np.ndarray]:
+    """
+    提取文档文本并编码为单个向量（兼容旧接口）
+    仅用于文件级别索引，不再用于分块文档
+    """
+    try:
+        text = extract_document_text(file_path)
+        if not text or len(text) < 10:
             return None
-        # 使用 Chinese-CLIP 的文本编码器
-        vec = encode_text(text[:512])  # 只用前512字符编码（避免过长）
+        vec = encode_text(text[:512])
         return vec
     except Exception as e:
         print(f"[Encoder] 文档编码失败 {file_path}: {e}")

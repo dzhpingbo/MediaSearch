@@ -112,10 +112,14 @@ def save_index(index, metadata, output_dir: str):
 
 def build_index(dirs: list, output_dir: str, use_caption: bool = False,
                 batch_save: int = 50, max_files: int = None,
-                file_types: set = None):
+                file_types: set = None, chunk_size: int = 300):
     """
     主函数：扫描并建立向量索引（Chinese-CLIP 向量）
+    
+    功能2: 文档分块索引 - 长文档按段落/字符数切分，每段单独建向量
+    
     file_types: 指定要处理的文件类型，如 {"image", "video", "document"}
+    chunk_size: 文档分块大小（字符数），默认300
     """
     from core_encoder import (
         encode_image, encode_video, encode_document,
@@ -150,6 +154,7 @@ def build_index(dirs: list, output_dir: str, use_caption: bool = False,
     new_meta = []
     processed = 0
     failed = 0
+    chunks_processed = 0   # 统计分块数量
 
     start = time.time()
     for i, f in enumerate(todo):
@@ -157,41 +162,77 @@ def build_index(dirs: list, output_dir: str, use_caption: bool = False,
         ftype = f["type"]
 
         try:
-            vec = None
-            caption = ""
-            doc_text = ""
+            stat = os.stat(path)
+            base_meta = {
+                "path": path,
+                "type": ftype,
+                "ext": f["ext"],
+                "filename": os.path.basename(path),
+                "size_mb": round(stat.st_size / 1024 / 1024, 2),
+                "mtime": datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M"),
+                "index_id": len(metadata) + len(new_meta),
+            }
 
             if ftype == "image":
                 vec = encode_image(path)
                 caption = describe_image(path) if use_caption else ""
+                new_vecs.append(vec.astype(np.float32))
+                new_meta.append({
+                    **base_meta,
+                    "doc_id": path,          # 图片/视频的 doc_id 就是自身路径
+                    "chunk_id": 0,
+                    "caption": caption,
+                    "doc_text": "",
+                    "chunk_text": "",
+                })
+                processed += 1
+
             elif ftype == "video":
                 vec = encode_video(path)
                 caption = describe_video(path) if use_caption else ""
+                new_vecs.append(vec.astype(np.float32))
+                new_meta.append({
+                    **base_meta,
+                    "doc_id": path,
+                    "chunk_id": 0,
+                    "caption": caption,
+                    "doc_text": "",
+                    "chunk_text": "",
+                })
+                processed += 1
+
             elif ftype == "document":
-                # 文档：提取文本并编码
+                # 功能2: 文档分块 - 长文档按段落/字符数切分，每段单独建向量
                 doc_text = extract_document_text(path)
-                vec = encode_document(path)
-                caption = doc_text[:200] if doc_text else ""  # 前200字符作为描述
+                caption = doc_text[:300] if doc_text else ""
+                
+                if not doc_text or len(doc_text) < 10:
+                    print(f"[索引] 文档无有效文本，跳过: {path}")
+                    failed += 1
+                    continue
 
-            if vec is None:
-                failed += 1
-                continue
+                # 分块编码
+                chunk_results = encode_document(path, chunk_size=chunk_size)
 
-            new_vecs.append(vec.astype(np.float32))
+                if not chunk_results:
+                    print(f"[索引] 文档编码失败，跳过: {path}")
+                    failed += 1
+                    continue
 
-            stat = os.stat(path)
-            new_meta.append({
-                "path": path,
-                "type": ftype,
-                "ext": f["ext"],
-                "caption": caption,
-                "doc_text": doc_text[:1000] if doc_text else "",  # 存储前1000字符用于搜索
-                "filename": os.path.basename(path),
-                "size_mb": round(stat.st_size / 1024 / 1024, 2),
-                "mtime": datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M"),
-                "index_id": len(metadata) + len(new_meta)
-            })
-            processed += 1
+                # 每个块单独建向量
+                for chunk in chunk_results:
+                    new_vecs.append(chunk["vector"].astype(np.float32))
+                    new_meta.append({
+                        **base_meta,
+                        "doc_id": path,                   # 同一文档的所有块共享 doc_id
+                        "chunk_id": chunk["chunk_id"],
+                        "caption": caption[:300],
+                        "doc_text": doc_text[:5000],      # 存储前5000字符（用于 BM25）
+                        "chunk_text": chunk["chunk_text"], # 当前块的文本（用于预览）
+                    })
+                    chunks_processed += 1
+
+                processed += 1
 
         except Exception as e:
             print(f"[索引] 处理失败 {path}: {e}")
@@ -204,7 +245,8 @@ def build_index(dirs: list, output_dir: str, use_caption: bool = False,
             remaining = (len(todo) - i - 1) / rate if rate > 0 else 0
             print(f"[进度] {i+1}/{len(todo)} | "
                   f"成功:{processed} 失败:{failed} | "
-                  f"速度:{rate:.1f}张/s | 剩余约:{remaining/60:.1f}分钟")
+                  f"块:{chunks_processed} | "
+                  f"速度:{rate:.1f}/s | 剩余约:{remaining/60:.1f}分钟")
 
         # 定期保存（断点续传）
         if len(new_vecs) >= batch_save:
@@ -212,6 +254,8 @@ def build_index(dirs: list, output_dir: str, use_caption: bool = False,
             index.add(mat)
             metadata.extend(new_meta)
             save_index(index, metadata, output_dir)
+            # 功能5: 同时更新 BM25 索引
+            _update_bm25_index(output_dir, new_meta)
             new_vecs.clear()
             new_meta.clear()
 
@@ -221,12 +265,106 @@ def build_index(dirs: list, output_dir: str, use_caption: bool = False,
         index.add(mat)
         metadata.extend(new_meta)
         save_index(index, metadata, output_dir)
+        _update_bm25_index(output_dir, new_meta)
 
     total_time = time.time() - start
-    print(f"\n[完成] 总计 {len(metadata)} 条记录，耗时 {total_time/60:.1f} 分钟")
-    print(f"[完成] 本次成功: {processed}，失败: {failed}")
+    print(f"\n[完成] 总计 {len(metadata)} 条记录（含 {chunks_processed} 个文档块）")
+    print(f"[完成] 本次成功: {processed}，失败: {failed}，耗时 {total_time/60:.1f} 分钟")
     print(f"[完成] 索引保存至: {output_dir}")
     return index, metadata
+
+
+# ══════════════════════════════════════════════════════════════════
+#  功能5: BM25 关键词索引（与向量索引协同）
+# ══════════════════════════════════════════════════════════════════
+import pickle
+from collections import defaultdict
+import re
+
+def _tokenize_chinese(text: str) -> list:
+    """简单中文分词（按字符 + 标点切分，用于 BM25）"""
+    if not text:
+        return []
+    # 按空格/换行/标点分割，再按字符n-gram
+    text = re.sub(r'[^\u4e00-\u9fa5a-zA-Z0-9]', ' ', str(text))
+    tokens = []
+    for word in text.split():
+        word = word.strip()
+        if not word:
+            continue
+        # 单字 + 双字混合
+        for i in range(len(word)):
+            if i + 1 <= len(word):
+                tokens.append(word[i:i+2])  # 双字词
+        tokens.append(word)  # 原始词
+    return [t for t in tokens if t]
+
+
+def build_bm25_index(output_dir: str, metadata: list, force: bool = False):
+    """
+    为文档类型构建 BM25 索引（功能5: 混合检索）
+    
+    BM25 是一种关键词检索算法，与向量检索互补：
+    - 向量检索：语义相似（如"海滩"和"海边"）
+    - BM25：关键词精确匹配（如"合同"必须在文档中出现）
+    """
+    bm25_path = os.path.join(output_dir, "bm25_index.pkl")
+    
+    # 如果已有 BM25 索引且不强制重建，加载后增量更新
+    bm25_corpus = []
+    if not force and os.path.exists(bm25_path):
+        try:
+            with open(bm25_path, "rb") as f:
+                bm25_data = pickle.load(f)
+                bm25_corpus = bm25_data.get("corpus", [])
+                print(f"[BM25] 加载已有索引：{len(bm25_corpus)} 条")
+        except Exception:
+            bm25_corpus = []
+
+    # 获取已有 doc_id 集合（避免重复）
+    existing_doc_ids = {item.get("doc_id") for item in bm25_corpus}
+    
+    # 收集文档级文本（每个 doc_id 只取一次）
+    doc_texts = {}
+    doc_meta_map = {}
+    for m in metadata:
+        doc_id = m.get("doc_id")
+        if doc_id and m.get("type") == "document":
+            # 取该文档所有块拼接后的完整文本
+            if doc_id not in doc_texts:
+                doc_texts[doc_id] = m.get("doc_text", "")
+                doc_meta_map[doc_id] = m
+
+    # 添加新文档到 BM25 语料库
+    added = 0
+    for doc_id, doc_text in doc_texts.items():
+        if doc_id and doc_text and len(doc_text) >= 10 and doc_id not in existing_doc_ids:
+            bm25_corpus.append({
+                "doc_id": doc_id,
+                "text": doc_text,
+                "path": doc_meta_map[doc_id].get("path", doc_id),
+                "filename": doc_meta_map[doc_id].get("filename", ""),
+                "ext": doc_meta_map[doc_id].get("ext", ""),
+                "size_mb": doc_meta_map[doc_id].get("size_mb", 0),
+                "mtime": doc_meta_map[doc_id].get("mtime", ""),
+            })
+            added += 1
+
+    if added > 0:
+        # 保存 BM25 索引
+        with open(bm25_path, "wb") as f:
+            pickle.dump({"corpus": bm25_corpus}, f)
+        print(f"[BM25] 索引更新完成：共 {len(bm25_corpus)} 个文档，新增 {added} 个")
+
+    return bm25_corpus
+
+
+def _update_bm25_index(output_dir: str, new_meta: list):
+    """增量更新 BM25 索引（内部函数）"""
+    try:
+        build_bm25_index(output_dir, new_meta)
+    except Exception as e:
+        print(f"[BM25] 增量更新失败: {e}")
 
 
 if __name__ == "__main__":
