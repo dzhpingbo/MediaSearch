@@ -31,10 +31,11 @@ python-docx>=1.0.0
 openpyxl>=3.1.0
 pdf2image>=1.17.0
 
-# OCR（PaddleOCR - 用于扫描型 PDF）
+# OCR（PaddleOCR 2.8.x - 中文识别强，与 paddlepaddle-gpu 2.6.2 兼容）
+# 注意：paddleocr 3.x 绑定 paddlepaddle 3.x，但 Windows GPU 无 3.x 版本，必须用 2.x
 paddlepaddle-gpu>=2.6.0
-# paddleocr 依赖较多，建议单独安装：
-# pip install paddleocr --no-deps
+paddleocr>=2.8.0,<3.0.0
+# 安装命令：pip install paddleocr==2.8.1 --no-deps
 
 # 自动增量更新（watchdog）
 watchdog>=3.0.0

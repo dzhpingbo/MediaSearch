@@ -253,55 +253,72 @@ def encode_images_batch(image_paths: list, batch_size: int = 16) -> list:
 
 
 # ══════════════════════════════════════════════════════════════════
-#  功能1: EasyOCR - 扫描型 PDF / 图片文字识别
-#  （PaddleOCR 依赖过于复杂，EasyOCR 更稳定，支持中文+GPU）
+#  功能1: PaddleOCR - 扫描型 PDF / 图片文字识别（中文识别更强）
 # ══════════════════════════════════════════════════════════════════
-_EASY_OCR_ENGINE = None
+_PADDLE_OCR_ENGINE = None
+_PADDLE_OCR_VERSION = None  # 'v2' or 'v3'
 
-def get_easy_ocr():
-    """懒加载 EasyOCR（首次使用时初始化，GPU 加速）"""
-    global _EASY_OCR_ENGINE
-    if _EASY_OCR_ENGINE is None:
+def _detect_paddle_ocr_version():
+    """检测 PaddleOCR 版本，返回 'v2' 或 'v3'"""
+    try:
+        import paddleocr
+        ver = paddleocr.__version__
+        if ver.startswith("2."):
+            return "v2"
+        else:
+            return "v3"
+    except Exception:
+        return "v3"
+
+def get_paddle_ocr():
+    """懒加载 PaddleOCR（首次使用时初始化，GPU 加速）"""
+    global _PADDLE_OCR_ENGINE, _PADDLE_OCR_VERSION
+    if _PADDLE_OCR_ENGINE is None:
         try:
-            import easyocr
-            print("[Encoder] 初始化 EasyOCR（中文+英文，GPU 加速）...")
-            _EASY_OCR_ENGINE = easyocr.Reader(
-                ['ch_sim', 'en'],      # 简体中文 + 英文
-                gpu=True,              # GPU 加速（GTX 1080 Ti）
-                model_storage_directory=os.path.expanduser("~/.cache/easyocr"),
-                download_enabled=True,
-            )
-            print("[Encoder] EasyOCR 初始化完成")
+            from paddleocr import PaddleOCR
+            _PADDLE_OCR_VERSION = _detect_paddle_ocr_version()
+            print(f"[Encoder] 初始化 PaddleOCR（中文 PP-OCRv4，版本: {_PADDLE_OCR_VERSION}）...")
+            if _PADDLE_OCR_VERSION == "v2":
+                # PaddleOCR 2.x API（与 paddlepaddle-gpu 2.6.2 兼容）
+                _PADDLE_OCR_ENGINE = PaddleOCR(
+                    use_angle_cls=True,
+                    lang='ch',
+                    use_gpu=True,
+                    show_log=False,
+                )
+            else:
+                # PaddleOCR 3.x API（use_gpu 等参数已移除，自动检测）
+                _PADDLE_OCR_ENGINE = PaddleOCR(lang='ch')
+            print("[Encoder] PaddleOCR 初始化完成")
         except Exception as e:
-            print(f"[Encoder] EasyOCR 初始化失败: {e}")
-            _EASY_OCR_ENGINE = None
-    return _EASY_OCR_ENGINE
+            print(f"[Encoder] PaddleOCR 初始化失败: {e}")
+            _PADDLE_OCR_ENGINE = None
+    return _PADDLE_OCR_ENGINE
 
 def ocr_image(image_path: str) -> str:
-    """用 EasyOCR 识别图片中的文字"""
+    """用 PaddleOCR 识别图片中的文字（中文识别能力强）"""
     try:
-        engine = get_easy_ocr()
+        engine = get_paddle_ocr()
         if engine is None:
             return ""
-        result = engine.readtext(image_path)
-        if not result:
+        result = engine.ocr(image_path, cls=True)
+        if not result or not result[0]:
             return ""
         lines = []
-        for detection in result:
-            if len(detection) >= 2:
-                text = detection[1].strip()
-                if text:
-                    lines.append(text)
+        for line in result[0]:
+            text = line[1][0]
+            if text and text.strip():
+                lines.append(text.strip())
         return "\n".join(lines)
     except Exception as e:
-        print(f"[Encoder] OCR 识别失败 {image_path}: {e}")
+        print(f"[Encoder] PaddleOCR 识别失败 {image_path}: {e}")
         return ""
 
 def ocr_pdf_pages(pdf_path: str, max_pages: int = 20) -> str:
-    """将 PDF 页面转为图片，用 EasyOCR 识别文字（扫描型 PDF）"""
+    """将 PDF 页面转为图片，用 PaddleOCR 识别文字（扫描型 PDF）"""
     try:
         from pdf2image import convert_from_path
-        engine = get_easy_ocr()
+        engine = get_paddle_ocr()
         if engine is None:
             return ""
         images = convert_from_path(pdf_path, dpi=150, first_page=1, last_page=max_pages)
@@ -314,11 +331,11 @@ def ocr_pdf_pages(pdf_path: str, max_pages: int = 20) -> str:
                 img.save(tmp, "JPEG", quality=85)
                 text = ocr_image(tmp)
                 if text:
-                    all_text.append(text)
+                    all_text.append(f"--- 第{i+1}页 ---\n{text}")
                 os.unlink(tmp)
             except Exception as e:
                 print(f"[Encoder] PDF 第{i+1}页 OCR 失败: {e}")
-        return "\n".join(all_text)
+        return "\n\n".join(all_text)
     except Exception as e:
         print(f"[Encoder] PDF OCR 失败 {pdf_path}: {e}")
         return ""
@@ -414,15 +431,15 @@ def extract_pdf_text(file_path: str, max_pages: int = 50, use_ocr_fallback: bool
                     text_parts.append(text)
         text = "\n".join(text_parts).strip()
 
-        # 功能1: 如果文本为空（扫描型PDF），自动回退到 OCR（EasyOCR）
+        # 功能1: 如果文本为空（扫描型PDF），自动回退到 PaddleOCR
         if (not text or len(text) < 50) and use_ocr_fallback:
-            print(f"[Encoder] PDF 文本内容过少，启用 EasyOCR: {file_path}")
+            print(f"[Encoder] PDF 文本内容过少，启用 PaddleOCR: {file_path}")
             text = ocr_pdf_pages(file_path, max_pages=max_pages)
 
         return text
     except Exception as e:
         print(f"[Encoder] PDF文本提取失败 {file_path}: {e}")
-        # 回退到 OCR（EasyOCR）
+        # 回退到 PaddleOCR
         if use_ocr_fallback:
             return ocr_pdf_pages(file_path, max_pages=max_pages)
         return ""
